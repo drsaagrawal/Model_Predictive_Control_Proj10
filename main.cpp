@@ -1,3 +1,4 @@
+#include <fstream>
 #include <math.h>
 #include <uWS/uWS.h>
 #include <chrono>
@@ -6,8 +7,10 @@
 #include <vector>
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
-#include "MPC.h"
 #include "json.hpp"
+#include "spline.h"
+
+using namespace std;
 
 // for convenience
 using json = nlohmann::json;
@@ -23,7 +26,7 @@ double rad2deg(double x) { return x * 180 / pi(); }
 string hasData(string s) {
   auto found_null = s.find("null");
   auto b1 = s.find_first_of("[");
-  auto b2 = s.rfind("}]");
+  auto b2 = s.find_first_of("}");
   if (found_null != string::npos) {
     return "";
   } else if (b1 != string::npos && b2 != string::npos) {
@@ -32,176 +35,266 @@ string hasData(string s) {
   return "";
 }
 
-// Evaluate a polynomial.
-double polyeval(Eigen::VectorXd coeffs, double x) {
-  double result = 0.0;
-  for (int i = 0; i < coeffs.size(); i++) {
-    result += coeffs[i] * pow(x, i);
-  }
-  return result;
+double distance(double x1, double y1, double x2, double y2)
+{
+	return sqrt((x2-x1)*(x2-x1)+(y2-y1)*(y2-y1));
+}
+int ClosestWaypoint(double x, double y, const vector<double> &maps_x, const vector<double> &maps_y)
+{
+
+	double closestLen = 100000; //large number
+	int closestWaypoint = 0;
+
+	for(int i = 0; i < maps_x.size(); i++)
+	{
+		double map_x = maps_x[i];
+		double map_y = maps_y[i];
+		double dist = distance(x,y,map_x,map_y);
+		if(dist < closestLen)
+		{
+			closestLen = dist;
+			closestWaypoint = i;
+		}
+
+	}
+
+	return closestWaypoint;
+
 }
 
-// Fit a polynomial.
-// Adapted from
-// https://github.com/JuliaMath/Polynomials.jl/blob/master/src/Polynomials.jl#L676-L716
-Eigen::VectorXd polyfit(Eigen::VectorXd xvals, Eigen::VectorXd yvals,
-                        int order) {
-  assert(xvals.size() == yvals.size());
-  assert(order >= 1 && order <= xvals.size() - 1);
-  Eigen::MatrixXd A(xvals.size(), order + 1);
+int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y)
+{
 
-  for (int i = 0; i < xvals.size(); i++) {
-    A(i, 0) = 1.0;
+	int closestWaypoint = ClosestWaypoint(x,y,maps_x,maps_y);
+
+	double map_x = maps_x[closestWaypoint];
+	double map_y = maps_y[closestWaypoint];
+
+	double heading = atan2((map_y-y),(map_x-x));
+
+	double angle = fabs(theta-heading);
+  angle = min(2*pi() - angle, angle);
+
+  if(angle > pi()/4)
+  {
+    closestWaypoint++;
+  if (closestWaypoint == maps_x.size())
+  {
+    closestWaypoint = 0;
+  }
   }
 
-  for (int j = 0; j < xvals.size(); j++) {
-    for (int i = 0; i < order; i++) {
-      A(j, i + 1) = A(j, i) * xvals(j);
-    }
-  }
+  return closestWaypoint;
+}
 
-  auto Q = A.householderQr();
-  auto result = Q.solve(yvals);
-  return result;
+// Transform from Cartesian x,y coordinates to Frenet s,d coordinates
+vector<double> getFrenet(double x, double y, double theta, const vector<double> &maps_x, const vector<double> &maps_y)
+{
+	int next_wp = NextWaypoint(x,y, theta, maps_x,maps_y);
+
+	int prev_wp;
+	prev_wp = next_wp-1;
+	if(next_wp == 0)
+	{
+		prev_wp  = maps_x.size()-1;
+	}
+
+	double n_x = maps_x[next_wp]-maps_x[prev_wp];
+	double n_y = maps_y[next_wp]-maps_y[prev_wp];
+	double x_x = x - maps_x[prev_wp];
+	double x_y = y - maps_y[prev_wp];
+
+	// find the projection of x onto n
+	double proj_norm = (x_x*n_x+x_y*n_y)/(n_x*n_x+n_y*n_y);
+	double proj_x = proj_norm*n_x;
+	double proj_y = proj_norm*n_y;
+
+	double frenet_d = distance(x_x,x_y,proj_x,proj_y);
+
+	//see if d value is positive or negative by comparing it to a center point
+
+	double center_x = 1000-maps_x[prev_wp];
+	double center_y = 2000-maps_y[prev_wp];
+	double centerToPos = distance(center_x,center_y,x_x,x_y);
+	double centerToRef = distance(center_x,center_y,proj_x,proj_y);
+
+	if(centerToPos <= centerToRef)
+	{
+		frenet_d *= -1;
+	}
+
+	// calculate s value
+	double frenet_s = 0;
+	for(int i = 0; i < prev_wp; i++)
+	{
+		frenet_s += distance(maps_x[i],maps_y[i],maps_x[i+1],maps_y[i+1]);
+	}
+
+	frenet_s += distance(0,0,proj_x,proj_y);
+
+	return {frenet_s,frenet_d};
+
+}
+
+// Transform from Frenet s,d coordinates to Cartesian x,y
+vector<double> getXY(double s, double d, const vector<double> &maps_s, const vector<double> &maps_x, const vector<double> &maps_y)
+{
+	int prev_wp = -1;
+
+	while(s > maps_s[prev_wp+1] && (prev_wp < (int)(maps_s.size()-1) ))
+	{
+		prev_wp++;
+	}
+
+	int wp2 = (prev_wp+1)%maps_x.size();
+
+	double heading = atan2((maps_y[wp2]-maps_y[prev_wp]),(maps_x[wp2]-maps_x[prev_wp]));
+	// the x,y,s along the segment
+	double seg_s = (s-maps_s[prev_wp]);
+
+	double seg_x = maps_x[prev_wp]+seg_s*cos(heading);
+	double seg_y = maps_y[prev_wp]+seg_s*sin(heading);
+
+	double perp_heading = heading-pi()/2;
+
+	double x = seg_x + d*cos(perp_heading);
+	double y = seg_y + d*sin(perp_heading);
+
+	return {x,y};
+
 }
 
 int main() {
   uWS::Hub h;
 
-  // MPC is initialized here!
-  MPC mpc;
+  // Load up map values for waypoint's x,y,s and d normalized normal vectors
+  vector<double> map_waypoints_x;
+  vector<double> map_waypoints_y;
+  vector<double> map_waypoints_s;
+  vector<double> map_waypoints_dx;
+  vector<double> map_waypoints_dy;
 
-  h.onMessage([&mpc](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  // Waypoint map to read from
+  string map_file_ = "../data/highway_map.csv";
+  // The max s value before wrapping around the track back to 0
+  double max_s = 6945.554;
+
+  int lane = 1;
+  double ref_vel = 49.5; //mph
+
+  ifstream in_map_(map_file_.c_str(), ifstream::in);
+
+  string line;
+  while (getline(in_map_, line)) {
+  	istringstream iss(line);
+  	double x;
+  	double y;
+  	float s;
+  	float d_x;
+  	float d_y;
+  	iss >> x;
+  	iss >> y;
+  	iss >> s;
+  	iss >> d_x;
+  	iss >> d_y;
+  	map_waypoints_x.push_back(x);
+  	map_waypoints_y.push_back(y);
+  	map_waypoints_s.push_back(s);
+  	map_waypoints_dx.push_back(d_x);
+  	map_waypoints_dy.push_back(d_y);
+  }
+
+  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
-    string sdata = string(data).substr(0, length);
-    cout << sdata << endl;
-    if (sdata.size() > 2 && sdata[0] == '4' && sdata[1] == '2') {
-      string s = hasData(sdata);
+    //auto sdata = string(data).substr(0, length);
+    //cout << sdata << endl;
+    if (length && length > 2 && data[0] == '4' && data[1] == '2') {
+
+      auto s = hasData(data);
+
       if (s != "") {
         auto j = json::parse(s);
+
         string event = j[0].get<string>();
+
         if (event == "telemetry") {
           // j[1] is the data JSON object
-          vector<double> ptsx = j[1]["ptsx"];
-          vector<double> ptsy = j[1]["ptsy"];
-          double px = j[1]["x"];
-          double py = j[1]["y"];
-          double psi = j[1]["psi"];
-          double v = j[1]["speed"];
-          double delta = j[1]["steering_angle"];
-          double a = j[1]["throttle"];
+
+        	// Main car's localization Data
+          	double car_x = j[1]["x"];
+          	double car_y = j[1]["y"];
+          	double car_s = j[1]["s"];
+          	double car_d = j[1]["d"];
+          	double car_yaw = j[1]["yaw"];
+          	double car_speed = j[1]["speed"];
+
+          	// Previous path data given to the Planner
+          	auto previous_path_x = j[1]["previous_path_x"];
+          	auto previous_path_y = j[1]["previous_path_y"];
+          	// Previous path's end s and d values
+          	double end_path_s = j[1]["end_path_s"];
+          	double end_path_d = j[1]["end_path_d"];
+
+          	// Sensor Fusion Data, a list of all other cars on the same side of the road.
+          	auto sensor_fusion = j[1]["sensor_fusion"];
+
+          	json msgJson;
+
+          	vector<double> next_x_vals;
+          	vector<double> next_y_vals;
 
 
-          Eigen::VectorXd ptsx_c(ptsx.size());
-          Eigen::VectorXd ptsy_c(ptsy.size());
+          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+          	//start
+          	// create a list widely spaced (x,y) way points, evenly spaced at 30m
+          	vector <double> ptsx;
+          	vector <double> ptsy;
 
-          for (int i = 0; i < ptsx.size(); i++) 
-          {
-            double x_diff = ptsx[i] - px;
-            double y_diff = ptsy[i] - py;
-            ptsx_c[i] = x_diff * cos(-psi) - y_diff * sin(-psi);
-            ptsy_c[i] = x_diff * sin(-psi) + y_diff * cos(-psi);
-          }
-          const double Lf = 2.67;
-          const double dt = 0.1;  // converted to s
+          	//reference x,y and yaw rate. Either from where the car is or the last from previous path
+          	double ref_x = car_x;
+          	double ref_y = car_y;
+          	double ref_yaw =  deg2rad(car_yaw);
 
-          // angle, x ,y will be 0 as converted to vehicle coordinate
+          	int prev_size = previous_path_x.size();
 
-          auto coeffs = polyfit(ptsx_c, ptsy_c, 3);
-          double cte = polyeval(coeffs, 0);
-          double epsi = -atan(coeffs[1]);
+          	//if previous path is almost empty use car state as starting
+          	if(prev_size<2)
+            {
+                double prev_car_x = carx - cos(car_yaw);
+                double prev_car_y = cary - sin(car_yaw);
 
-          // Predict state after latency (psi,x,y are 0)
-          double p_px = 0.0 + v  *cos(0)* dt; 
-          double p_py = 0.0 +v  *sin(0)* dt;  
-          double p_psi = 0.0 - v * delta / Lf * dt;
-          double p_v = v + a * dt;
-          double p_cte = cte + v * sin(epsi) * dt;
-          double p_epsi = epsi - v * delta / Lf * dt;  // delta as -delta
+                ptsx.push_back(prev_car_x);
+                ptsx.push_back(car_x);
 
-          //cout << " Px "<< px<< " Py "<< py<<" p_px "<<p_px<<" p_py "<<p_py<< endl; 
+                ptsy.push_back(prev_car_y);
+                ptsy.push_back(car_y);
+            }
+            // use the previous path's endpoint as starting ref
 
 
-          //state vector
-          Eigen::VectorXd state(6);
-          state <<p_px, p_py, p_psi, p_v, p_cte, p_epsi;
+          	double dist_inc = 0.5;
 
-          //calling solver
-          auto vars = mpc.Solve(state, coeffs);
+            for(int i = 0; i < 50; i++)
+            {
+                double next_s = car_s+(dist_inc*(i+1));
+                double next_d = 6;
+                vector <double> xy = getXY(next_s,next_d,map_waypoints_s,map_waypoints_x,map_waypoints_y);
 
-          double steer_value = vars[0] ;
-          double throttle_value = vars[1];
+                next_x_vals.push_back(xy[0]);
+                next_y_vals.push_back(xy[1]);
+            }
+            //end
+          	msgJson["next_x"] = next_x_vals;
+          	msgJson["next_y"] = next_y_vals;
 
+          	auto msg = "42[\"control\","+ msgJson.dump()+"]";
 
+          	//this_thread::sleep_for(chrono::milliseconds(1000));
+          	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
 
-
-          /*
-          * TODO: Calculate steering angle and throttle using MPC.
-          *
-          * Both are in between [-1, 1].
-          *
-          */
-
-          json msgJson;
-          // NOTE: Remember to divide by deg2rad(25) before you send the steering value back.
-          // Otherwise the values will be in between [-deg2rad(25), deg2rad(25] instead of [-1, 1].
-          msgJson["steering_angle"] = steer_value;
-          msgJson["throttle"] = throttle_value;
-
-          //Display the MPC predicted trajectory 
-          vector<double> mpc_x_vals;
-          vector<double> mpc_y_vals;
-
-          mpc_x_vals.push_back(state[0]);
-          mpc_y_vals.push_back(state[1]);
-
-          //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
-          // the points in the simulator are connected by a Green line
-
-          //adding point
-          for (int i = 2; i < vars.size(); i+=2) 
-          {
-            mpc_x_vals.push_back(vars[i]);
-            mpc_y_vals.push_back(vars[i+1]);
-          }
-
-          msgJson["mpc_x"] = mpc_x_vals;
-          msgJson["mpc_y"] = mpc_y_vals;
-
-          //Display the waypoints/reference line
-          vector<double> next_x_vals;
-          vector<double> next_y_vals;
-
-          //adding point
-          for (double i = 0; i < 100; i += 3)
-          {
-            next_x_vals.push_back(i);
-            next_y_vals.push_back(polyeval(coeffs, i));
-          }
-
-          //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
-          // the points in the simulator are connected by a Yellow line
-
-          msgJson["next_x"] = next_x_vals;
-          msgJson["next_y"] = next_y_vals;
-
-
-          auto msg = "42[\"steer\"," + msgJson.dump() + "]";
-          std::cout << msg << std::endl;
-          // Latency
-          // The purpose is to mimic real driving conditions where
-          // the car does actuate the commands instantly.
-          //
-          // Feel free to play around with this value but should be to drive
-          // around the track with 100ms latency.
-          //
-          // NOTE: REMEMBER TO SET THIS TO 100 MILLISECONDS BEFORE
-          // SUBMITTING.
-          this_thread::sleep_for(chrono::milliseconds(100));
-          ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
         }
       } else {
         // Manual driving
