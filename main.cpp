@@ -201,15 +201,18 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+
+
+    int lane = 1;
+    double ref_vel = 0 ; //mph
+  h.onMessage([&ref_vel,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy,&lane](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
     //auto sdata = string(data).substr(0, length);
     //cout << sdata << endl;
-    int lane = 1;
-    double ref_vel = 49.5; //mph
+    
     if (length && length > 2 && data[0] == '4' && data[1] == '2') {
 
       auto s = hasData(data);
@@ -238,9 +241,122 @@ int main() {
           	double end_path_d = j[1]["end_path_d"];
 
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
-          	auto sensor_fusion = j[1]["sensor_fusion"];
+          	//auto sensor_fusion = j[1]["sensor_fusion"];
+          	vector <vector<double>> sensor_fusion = j[1]["sensor_fusion"];
+          	int prev_size = previous_path_x.size();
 
           	json msgJson;
+
+          	if(prev_size>0)
+          	{
+          		car_s = end_path_s;
+          	}
+
+          	bool too_close = false;
+          	bool car_right = false;
+          	bool car_left = false;
+          	bool car_ahead = false;
+
+          	//find ref_v to use
+          	for (int i = 0;i<sensor_fusion.size();i++)
+          	{
+          		//car is in my lane
+          		float d = sensor_fusion[i][6];
+          		int car_lane = -1;
+          		if (d>0 && d<4)
+          			car_lane = 0;
+          		else if(d>4 && d<8)
+          			car_lane = 1;
+          		else if(d>8 && d<12)
+          			car_lane = 2; 
+          		else
+          			continue;
+          		// if car in same lane
+          			double vx = sensor_fusion[i][3];
+          			double vy = sensor_fusion[i][4];
+          			double check_speed = sqrt(vx*vx+vy*vy);
+          			double check_car_s = sensor_fusion[i][5];
+
+          			check_car_s += ((double)prev_size*0.02*check_speed); //if using previous point can project s value out
+          			if (car_lane == lane)
+          			{
+          				if((check_car_s > car_s) && (check_car_s - car_s)<20)
+          					car_ahead = true;
+
+          			}
+
+          			else if(car_lane == lane-1)
+          			{
+          				if((car_s+20 >check_car_s) && (check_car_s+20 > car_s))
+          					car_left = true;
+          			}
+
+          			else if(car_lane == lane+1)
+          			{
+          				if((car_s+20 >check_car_s) && (check_car_s+20 > car_s))
+          					car_right = true;
+          			}
+          	}
+
+          			if(car_ahead == true)
+          			{
+          				too_close = true;
+          			}
+
+
+          			if(car_ahead == true)
+          			{
+          				if(lane ==0 && car_right !=true)
+          				{
+          					lane =1;
+          					too_close = false;
+          				}
+
+          				else if(lane ==1 && car_right !=true)
+          				{
+          					lane =2;
+          					too_close = false;
+          				}
+
+          				else if(lane ==1 && car_left !=true)
+          				{
+          					lane =0;
+          					too_close = false;
+          				}
+
+          				else if(lane ==2 && car_left !=true)
+          				{
+          					lane =1;
+          					too_close = false;
+          				}
+          			}
+
+
+
+          			/*// check s values greater than mine and s gap
+          			if((check_car_s > car_s) && (check_car_s - car_s)<30)
+          			{
+          				//do some logic here, lower ref velocity so that we dont crash
+          				//also flag to try to change lanes.
+          				//ref_vel = 29.5; //mph
+          				too_close = true;
+
+          				if(lane > 0)
+          				{
+          					lane = 0;
+          				}
+          			}*/
+          	
+
+
+          	if (too_close)
+          	{
+          		ref_vel -= 0.4; 
+          	}
+          	else if(ref_vel < 49.5)
+          	{
+          		ref_vel += 0.4;
+          	}
 
          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
           	//start
@@ -253,7 +369,7 @@ int main() {
           	double ref_y = car_y;
           	double ref_yaw =  deg2rad(car_yaw);
 
-          	int prev_size = previous_path_x.size();
+          	
 
           	//if previous path is almost empty use car state as starting
           	if(prev_size<2)
@@ -307,7 +423,7 @@ int main() {
                 double shift_y = ptsy[i]-ref_y;
 
                 ptsx[i] = (shift_x *cos(0-ref_yaw)-shift_y*sin(0-ref_yaw));
-                ptsy[i] = (shift_x *sin(0-ref_yaw)+shift_y*sin(0-ref_yaw));
+                ptsy[i] = (shift_x *sin(0-ref_yaw)+shift_y*cos(0-ref_yaw));
             }
 
             //create a spline
